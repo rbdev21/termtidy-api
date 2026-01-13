@@ -2,6 +2,7 @@ import os
 import uuid
 import threading
 import time
+import re
 from io import BytesIO
 from typing import Any, Dict, List, Optional
 
@@ -78,13 +79,86 @@ def _job_read(job_id: str) -> Dict[str, Any]:
 
 
 def _job_is_canceled(job_id: str) -> bool:
-    # Small helper so the runner can bail out early.
     try:
         job = _job_read(job_id)
         return (job.get("status") == "canceled")
     except Exception:
-        # If we can't read the job, don't hard-crash the worker loop.
         return False
+
+
+# ----------------------------
+# CSV cleaning + filtering helpers
+# ----------------------------
+def _norm_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    return df
+
+
+def _find_col(cols: List[str], candidates: List[str]) -> Optional[str]:
+    s = set(cols)
+    for c in candidates:
+        if c in s:
+            return c
+    return None
+
+
+def _money_to_float(series: pd.Series) -> pd.Series:
+    # Handles £, commas, and "1,234.56" etc.
+    s = series.astype(str).fillna("")
+    s = s.str.replace(",", "", regex=False)
+    s = s.str.replace(r"[^\d.\-]", "", regex=True)
+    return pd.to_numeric(s, errors="coerce").fillna(0.0)
+
+
+def _clean_and_filter_search_terms(
+    search_df: pd.DataFrame,
+    min_clicks: int,
+    min_cost: float,
+) -> pd.DataFrame:
+    """
+    What this does:
+    1) Normalise column names
+    2) Drop rows where the search term is blank
+    3) Apply min_clicks and min_cost filters (if those columns exist)
+    """
+    if search_df is None or search_df.empty:
+        return pd.DataFrame()
+
+    df = _norm_cols(search_df)
+
+    # Find the search term column
+    term_col = _find_col(
+        list(df.columns),
+        [
+            "search term",
+            "search term (search query)",
+            "search query",
+            "query",
+        ],
+    )
+
+    if term_col:
+        # Keep only rows where term is non-empty after stripping whitespace
+        df[term_col] = df[term_col].astype(str).fillna("").str.strip()
+        df = df[df[term_col] != ""]
+    else:
+        # Fallback: at least drop fully-empty rows
+        df = df.dropna(how="all")
+
+    # Apply filters if possible
+    clicks_col = _find_col(list(df.columns), ["clicks"])
+    cost_col = _find_col(list(df.columns), ["cost"])
+
+    if clicks_col:
+        clicks = pd.to_numeric(df[clicks_col], errors="coerce").fillna(0).astype(int)
+        df = df[clicks >= int(min_clicks)]
+
+    if cost_col:
+        cost = _money_to_float(df[cost_col])
+        df = df[cost >= float(min_cost)]
+
+    return df
 
 
 # ----------------------------
@@ -137,6 +211,21 @@ def run_audit(req: RunRequest):
         "currency": req.currency,
     }
 
+    # NEW: filter before pipeline so compute matches billable rows
+    search_df = _clean_and_filter_search_terms(search_df, cfg["min_clicks"], cfg["min_cost"])
+    if search_df.empty:
+        return {
+            "ok": True,
+            "stats": {
+                "initial_rows": 0,
+                "filtered_rows": 0,
+                "candidates": 0,
+                "negatives_before_brand": 0,
+                "negatives_after_brand": 0,
+            },
+            "results": [],
+        }
+
     try:
         final_df, stats = run_negative_keyword_pipeline(search_df, kw_df, cfg)
     except ValueError as e:
@@ -157,26 +246,33 @@ def run_audit(req: RunRequest):
 def _run_job(job_id: str, search_df: pd.DataFrame, kw_df: pd.DataFrame, cfg: Dict[str, Any]):
     """
     Background runner.
-    We can't get granular progress out of the pipeline without callbacks,
-    but we CAN:
-      - update message/progress at meaningful milestones
+    We can:
+      - update message/progress at milestones
       - honour cancellation requests
     """
     try:
-        _job_update(job_id, {"status": "running", "progress": 5, "message": "Starting audit…", "error": None})
+        _job_update(
+            job_id,
+            {
+                "status": "running",
+                "progress": 5,
+                "message": f"Starting audit… ({len(search_df):,} rows to process)",
+                "error": None,
+            },
+        )
 
         if _job_is_canceled(job_id):
             _job_update(job_id, {"status": "canceled", "progress": 100, "message": "Canceled."})
             return
 
-        _job_update(job_id, {"progress": 10, "message": "Preparing data…"})
-        time.sleep(0.05)  # tiny yield so UI can pick it up quickly
+        _job_update(job_id, {"progress": 15, "message": "Preparing data…"})
+        time.sleep(0.05)
 
         if _job_is_canceled(job_id):
             _job_update(job_id, {"status": "canceled", "progress": 100, "message": "Canceled."})
             return
 
-        _job_update(job_id, {"progress": 20, "message": "Running pipeline (this may take a couple of minutes)…"})
+        _job_update(job_id, {"progress": 25, "message": "Running pipeline (this may take a couple of minutes)…"})
 
         # Main work
         final_df, stats = run_negative_keyword_pipeline(search_df, kw_df, cfg)
@@ -215,7 +311,6 @@ def _run_job(job_id: str, search_df: pd.DataFrame, kw_df: pd.DataFrame, cfg: Dic
             },
         )
     except Exception as e:
-        # Always store a predictable shape
         _job_update(
             job_id,
             {
@@ -267,10 +362,49 @@ async def start_job(
         "currency": currency,
     }
 
+    # Create job row first
     job_id = _job_create(user_id=x_user_id)
 
-    # Start background thread
-    t = threading.Thread(target=_run_job, args=(job_id, search_df, kw_df, cfg), daemon=True)
+    # NEW: drop blank rows + apply filters BEFORE starting the pipeline
+    initial_rows = int(len(search_df))
+    filtered_search_df = _clean_and_filter_search_terms(search_df, cfg["min_clicks"], cfg["min_cost"])
+    filtered_rows = int(len(filtered_search_df))
+
+    if filtered_rows == 0:
+        _job_update(
+            job_id,
+            {
+                "status": "done",
+                "progress": 100,
+                "message": "No rows left after filters (blank rows removed + min clicks/cost applied).",
+                "stats": {
+                    "initial_rows": initial_rows,
+                    "filtered_rows": 0,
+                    "candidates": 0,
+                    "negatives_before_brand": 0,
+                    "negatives_after_brand": 0,
+                },
+                "results": [],
+                "error": None,
+            },
+        )
+        return {"ok": True, "job_id": job_id, "status": "done"}
+
+    # Update job message so UI shows the real count being processed
+    _job_update(
+        job_id,
+        {
+            "message": f"Queued… ({filtered_rows:,} rows after filters)",
+            "progress": 0,
+        },
+    )
+
+    # Start background thread with FILTERED dataframe
+    t = threading.Thread(
+        target=_run_job,
+        args=(job_id, filtered_search_df, kw_df, cfg),
+        daemon=True,
+    )
     t.start()
 
     return {"ok": True, "job_id": job_id, "status": "queued"}
