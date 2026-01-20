@@ -580,9 +580,12 @@ def get_job(job_id: str):
     try:
         job = _job_read(job_id)
     except KeyError:
-        raise HTTPException(status_code=404, detail="Job not found")
+        # Job is legitimately missing
+        return {"ok": False, "error": "Job not found", "job_id": job_id}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to read job: {e}")
+        # Log the real error in Render logs
+        print(f"[get_job] Failed to read job {job_id}: {repr(e)}")
+        return {"ok": False, "error": "Failed to read job", "detail": str(e), "job_id": job_id}
 
     return {
         "ok": True,
