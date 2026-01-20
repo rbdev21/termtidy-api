@@ -80,11 +80,13 @@ def _job_create(user_id: Optional[str]) -> str:
 
 def _job_read(job_id: str) -> Dict[str, Any]:
     sb = _require_supabase()
-    res = sb.table(JOBS_TABLE).select("*").eq("id", job_id).single().execute()
-    data = res.data
+    res = sb.table(JOBS_TABLE).select("*").eq("id", job_id).limit(1).execute()
+    if getattr(res, "error", None):
+        print(f"[_job_read] Supabase error for job_id={job_id}: {res.error}")
+    data = res.data or []
     if not data:
         raise KeyError("Job not found")
-    return data
+    return data[0]
 
 
 def _job_is_canceled(job_id: str) -> bool:
