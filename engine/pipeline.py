@@ -1,6 +1,7 @@
 import os
 import json
-from typing import List, Dict, Any, Tuple, Optional
+import math
+from typing import List, Dict, Any, Tuple, Optional, Callable
 
 import numpy as np
 import pandas as pd
@@ -172,6 +173,76 @@ Respond ONLY as strict JSON in this format:
 """.strip()
 
 
+def build_multirow_llm_prompt(rows: List[Dict[str, Any]]) -> str:
+    items = []
+    for i, row in enumerate(rows):
+        items.append(
+            {
+                "id": i,
+                "search_term": row.get("search_term", ""),
+                "best_keyword": row.get("best_keyword", ""),
+                "clicks": row.get("clicks", 0),
+                "cost": row.get("cost", 0),
+                "conversions": row.get("conversions", 0),
+                "similarity": float(row.get("similarity", 0.0) or 0.0),
+            }
+        )
+
+    payload = json.dumps(items, ensure_ascii=True)
+
+    return f"""
+You are an expert Google Ads PPC specialist.
+
+We are auditing search terms to decide which should be added as negative keywords.
+Each item includes a unique "id" plus context. Decide for EACH item.
+
+Rules:
+- Mark "exclude": true only if it is clearly irrelevant or low-intent for the given keyword.
+- Do NOT exclude search terms that are obviously relevant, even if they have no conversions yet.
+- The suggested_negative should be a single word or short phrase that blocks similar irrelevant queries.
+- Keep the reason short (1–2 sentences).
+
+Input items (JSON array):
+{payload}
+
+Respond ONLY as strict JSON array. Each item must include:
+{{
+  "id": number,
+  "exclude": true or false,
+  "suggested_negative": "single word or short phrase",
+  "reason": "short explanation"
+}}
+""".strip()
+
+
+def parse_llm_batch_response(text: str, expected_len: int) -> List[Dict[str, Any]]:
+    data = json.loads(text)
+    if isinstance(data, dict) and "decisions" in data:
+        data = data["decisions"]
+    if not isinstance(data, list):
+        raise ValueError("LLM response was not a JSON array.")
+    if expected_len and len(data) != expected_len:
+        raise ValueError("LLM response length did not match request length.")
+
+    decisions: List[Dict[str, Any]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        decisions.append(
+            {
+                "id": int(item.get("id", -1)),
+                "exclude": bool(item.get("exclude", False)),
+                "suggested_negative": str(item.get("suggested_negative", "")),
+                "reason": str(item.get("reason", "")),
+            }
+        )
+
+    if expected_len and len(decisions) != expected_len:
+        raise ValueError("LLM response missing decisions.")
+
+    return decisions
+
+
 def llm_decide_for_row(row: Dict[str, Any], model: str) -> Dict[str, Any]:
     client = get_client()
     prompt = build_llm_prompt(row)
@@ -198,11 +269,24 @@ def llm_decide_for_row(row: Dict[str, Any], model: str) -> Dict[str, Any]:
         }
 
 
+def llm_decide_for_batch(rows: List[Dict[str, Any]], model: str) -> List[Dict[str, Any]]:
+    client = get_client()
+    prompt = build_multirow_llm_prompt(rows)
+    completion = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1,
+    )
+    content = completion.choices[0].message.content or ""
+    return parse_llm_batch_response(content, expected_len=len(rows))
+
+
 def decide_with_llm(
     candidates_df: pd.DataFrame,
     model: str,
     use_llm: bool,
     batch_size: int,
+    progress_cb: Optional[Callable[[int, int, int, int, bool], None]] = None,
 ) -> pd.DataFrame:
     records = candidates_df.to_dict("records")
     decisions: List[Dict[str, Any]] = []
@@ -210,17 +294,41 @@ def decide_with_llm(
     if not records:
         return candidates_df.assign(exclude=False, reason="No candidates.")
 
-    for batch in batch_list(records, batch_size=batch_size):
-        for row in batch:
-            if use_llm:
-                decision = llm_decide_for_row(row, model=model)
-            else:
-                decision = {
-                    "exclude": True,
-                    "suggested_negative": str(row.get("search_term", "")),
-                    "reason": "Heuristic: below similarity threshold; LLM disabled.",
-                }
-            decisions.append(decision)
+    total = len(records)
+    done = 0
+    total_batches = max(1, math.ceil(total / max(1, int(batch_size))))
+
+    for batch_index, batch in enumerate(batch_list(records, batch_size=batch_size), start=1):
+        if progress_cb:
+            progress_cb(batch_index, total_batches, done, total, True)
+        if use_llm:
+            try:
+                batch_decisions = llm_decide_for_batch(batch, model=model)
+                batch_decisions = sorted(batch_decisions, key=lambda d: d.get("id", 0))
+                for d in batch_decisions:
+                    decisions.append(
+                        {
+                            "exclude": d.get("exclude", False),
+                            "suggested_negative": d.get("suggested_negative", ""),
+                            "reason": d.get("reason", ""),
+                        }
+                    )
+            except Exception:
+                for row in batch:
+                    decisions.append(llm_decide_for_row(row, model=model))
+        else:
+            for row in batch:
+                decisions.append(
+                    {
+                        "exclude": True,
+                        "suggested_negative": str(row.get("search_term", "")),
+                        "reason": "Heuristic: below similarity threshold; LLM disabled.",
+                    }
+                )
+
+        done += len(batch)
+        if progress_cb:
+            progress_cb(batch_index, total_batches, done, total, False)
 
     return pd.concat([candidates_df.reset_index(drop=True), pd.DataFrame(decisions)], axis=1)
 
@@ -229,10 +337,26 @@ def decide_with_llm(
 # Main pipeline
 # -------------------------------------------------------------------
 
+def _maybe_update_job(
+    update_job: Optional[Callable[[str, Dict[str, Any]], None]],
+    job_id: Optional[str],
+    progress: int,
+    message: str,
+) -> None:
+    if not update_job or not job_id:
+        return
+    try:
+        update_job(job_id, {"progress": int(progress), "message": message})
+    except Exception:
+        pass
+
+
 def run_negative_keyword_pipeline(
     search_df: pd.DataFrame,
     kw_df: pd.DataFrame,
     config: Dict[str, Any],
+    job_id: Optional[str] = None,
+    update_job: Optional[Callable[[str, Dict[str, Any]], None]] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
 
     min_clicks = config["min_clicks"]
@@ -244,6 +368,8 @@ def run_negative_keyword_pipeline(
     chat_model = config["chat_model"]
     brand_terms_raw = config.get("brand_terms", [])
     brand_terms = [t.strip().lower() for t in brand_terms_raw if str(t).strip()]
+
+    _maybe_update_job(update_job, job_id, 10, "Normalizing data…")
 
     # Normalize + drop totals
     search_df = normalize_columns(search_df)
@@ -283,6 +409,8 @@ def run_negative_keyword_pipeline(
     if filtered.empty:
         return pd.DataFrame(), stats
 
+    _maybe_update_job(update_job, job_id, 25, "Generating embeddings…")
+
     # Prepare texts (sanitize happens inside get_embeddings anyway)
     search_texts = filtered["search_term"].tolist()
     kw_texts = kw_df["keyword"].tolist()
@@ -290,6 +418,8 @@ def run_negative_keyword_pipeline(
     # Embeddings (batched + sanitized)
     search_emb = get_embeddings(search_texts, model=embedding_model, batch_size=256)
     kw_emb = get_embeddings(kw_texts, model=embedding_model, batch_size=256)
+
+    _maybe_update_job(update_job, job_id, 40, "Computing similarities…")
 
     # Similarity
     sim_matrix = cosine_similarity(search_emb, kw_emb)
@@ -305,12 +435,44 @@ def run_negative_keyword_pipeline(
     if candidates.empty:
         return pd.DataFrame(), stats
 
+    _maybe_update_job(update_job, job_id, 40, "Running LLM decisions…")
+
     # LLM decision
-    decided = decide_with_llm(candidates, model=chat_model, use_llm=use_llm, batch_size=llm_batch_size)
+    total_candidates = int(len(candidates))
+
+    def progress_cb(
+        batch_index: int,
+        total_batches: int,
+        done: int,
+        total: int,
+        is_start: bool,
+    ) -> None:
+        if total_batches <= 0:
+            return
+        start = 40
+        end = 80
+        step = batch_index - (1 if is_start else 0)
+        pct = start + int((step / total_batches) * (end - start))
+        _maybe_update_job(
+            update_job,
+            job_id,
+            pct,
+            f"LLM batch {batch_index}/{total_batches}",
+        )
+
+    decided = decide_with_llm(
+        candidates,
+        model=chat_model,
+        use_llm=use_llm,
+        batch_size=llm_batch_size,
+        progress_cb=progress_cb,
+    )
     negatives_all = decided[decided["exclude"] == True].copy()
     stats["negatives_before_brand"] = int(len(negatives_all))
     if negatives_all.empty:
         return pd.DataFrame(), stats
+
+    _maybe_update_job(update_job, job_id, 85, "Applying brand protection…")
 
     # Brand protection
     if brand_terms:
@@ -328,6 +490,8 @@ def run_negative_keyword_pipeline(
     stats["negatives_after_brand"] = int(len(final_negatives))
     if final_negatives.empty:
         return pd.DataFrame(), stats
+
+    _maybe_update_job(update_job, job_id, 90, "Finalizing results…")
 
     # Exact match only: full search term in []
     final_negatives["match_type"] = "Exact"

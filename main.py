@@ -343,7 +343,13 @@ def run_audit(req: RunRequest):
         }
 
     try:
-        final_df, stats = run_negative_keyword_pipeline(search_df, kw_df, cfg)
+        final_df, stats = run_negative_keyword_pipeline(
+            search_df,
+            kw_df,
+            cfg,
+            job_id=job_id,
+            update_job=_job_update,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
