@@ -1,6 +1,7 @@
 import os
 import json
 import math
+import time
 from typing import List, Dict, Any, Tuple, Optional, Callable
 
 import numpy as np
@@ -361,6 +362,11 @@ def run_negative_keyword_pipeline(
     brand_terms = [t.strip().lower() for t in brand_terms_raw if str(t).strip()]
 
     _maybe_update_job(update_job, job_id, 10)
+    try:
+        time.sleep(0)
+    except Exception:
+        pass
+    print("[pipeline] progress 10%")
 
     # Normalize + drop totals
     search_df = normalize_columns(search_df)
@@ -401,6 +407,11 @@ def run_negative_keyword_pipeline(
         return pd.DataFrame(), stats
 
     _maybe_update_job(update_job, job_id, 25)
+    try:
+        time.sleep(0)
+    except Exception:
+        pass
+    print("[pipeline] progress 25%")
 
     # Prepare texts (sanitize happens inside get_embeddings anyway)
     search_texts = filtered["search_term"].tolist()
@@ -411,6 +422,11 @@ def run_negative_keyword_pipeline(
     kw_emb = get_embeddings(kw_texts, model=embedding_model, batch_size=256)
 
     _maybe_update_job(update_job, job_id, 40)
+    try:
+        time.sleep(0)
+    except Exception:
+        pass
+    print("[pipeline] progress 40%")
 
     # Similarity
     sim_matrix = cosine_similarity(search_emb, kw_emb)
@@ -418,6 +434,11 @@ def run_negative_keyword_pipeline(
     best_sim = sim_matrix[np.arange(len(filtered)), best_kw_idx]
 
     _maybe_update_job(update_job, job_id, 50)
+    try:
+        time.sleep(0)
+    except Exception:
+        pass
+    print("[pipeline] progress 50%")
 
     filtered["best_keyword"] = [str(kw_texts[i]) for i in best_kw_idx]
     filtered["similarity"] = best_sim
@@ -429,6 +450,11 @@ def run_negative_keyword_pipeline(
         return pd.DataFrame(), stats
 
     _maybe_update_job(update_job, job_id, 60)
+    try:
+        time.sleep(0)
+    except Exception:
+        pass
+    print("[pipeline] progress 60%")
 
     # LLM decision
     records = candidates.to_dict("records")
@@ -441,6 +467,11 @@ def run_negative_keyword_pipeline(
     ):
         pct = 60 + int((batch_index / total_batches) * (85 - 60))
         _maybe_update_job(update_job, job_id, pct)
+        try:
+            time.sleep(0)
+        except Exception:
+            pass
+        print(f"[pipeline] progress {pct}% (batch {batch_index}/{total_batches})")
 
         if use_llm:
             try:
@@ -468,6 +499,11 @@ def run_negative_keyword_pipeline(
                 )
 
     _maybe_update_job(update_job, job_id, 85)
+    try:
+        time.sleep(0)
+    except Exception:
+        pass
+    print("[pipeline] progress 85%")
 
     decided = pd.concat(
         [candidates.reset_index(drop=True), pd.DataFrame(decisions)], axis=1
@@ -476,8 +512,6 @@ def run_negative_keyword_pipeline(
     stats["negatives_before_brand"] = int(len(negatives_all))
     if negatives_all.empty:
         return pd.DataFrame(), stats
-
-    _maybe_update_job(update_job, job_id, 90)
 
     # Brand protection
     if brand_terms:
@@ -497,6 +531,11 @@ def run_negative_keyword_pipeline(
         return pd.DataFrame(), stats
 
     _maybe_update_job(update_job, job_id, 90)
+    try:
+        time.sleep(0)
+    except Exception:
+        pass
+    print("[pipeline] progress 90%")
 
     # Exact match only: full search term in []
     final_negatives["match_type"] = "Exact"
