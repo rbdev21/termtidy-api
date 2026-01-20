@@ -61,6 +61,14 @@ def _job_update(job_id: str, patch: Dict[str, Any]):
     sb.table(JOBS_TABLE).update(patch).eq("id", job_id).execute()
 
 
+def _maybe_update_job(update_job, job_id, progress):
+    if update_job and job_id:
+        try:
+            update_job(job_id, {"progress": progress})
+        except Exception as e:
+            print(f"[maybe_update_job] failed to update progress {progress}: {e}")
+
+
 def _job_create(user_id: Optional[str]) -> str:
     sb = _require_supabase()
     job_id = str(uuid.uuid4())

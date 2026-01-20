@@ -286,7 +286,6 @@ def decide_with_llm(
     model: str,
     use_llm: bool,
     batch_size: int,
-    progress_cb: Optional[Callable[[int, int, int, int, bool], None]] = None,
 ) -> pd.DataFrame:
     records = candidates_df.to_dict("records")
     decisions: List[Dict[str, Any]] = []
@@ -295,12 +294,9 @@ def decide_with_llm(
         return candidates_df.assign(exclude=False, reason="No candidates.")
 
     total = len(records)
-    done = 0
     total_batches = max(1, math.ceil(total / max(1, int(batch_size))))
 
     for batch_index, batch in enumerate(batch_list(records, batch_size=batch_size), start=1):
-        if progress_cb:
-            progress_cb(batch_index, total_batches, done, total, True)
         if use_llm:
             try:
                 batch_decisions = llm_decide_for_batch(batch, model=model)
@@ -325,10 +321,6 @@ def decide_with_llm(
                         "reason": "Heuristic: below similarity threshold; LLM disabled.",
                     }
                 )
-
-        done += len(batch)
-        if progress_cb:
-            progress_cb(batch_index, total_batches, done, total, False)
 
     return pd.concat([candidates_df.reset_index(drop=True), pd.DataFrame(decisions)], axis=1)
 
@@ -439,29 +431,46 @@ def run_negative_keyword_pipeline(
     _maybe_update_job(update_job, job_id, 60)
 
     # LLM decision
-    total_candidates = int(len(candidates))
+    records = candidates.to_dict("records")
+    total_candidates = int(len(records))
+    total_batches = max(1, math.ceil(total_candidates / max(1, int(llm_batch_size))))
+    decisions: List[Dict[str, Any]] = []
 
-    def progress_cb(
-        batch_index: int,
-        total_batches: int,
-        done: int,
-        total: int,
-        is_start: bool,
-    ) -> None:
-        if total_batches <= 0:
-            return
-        start = 60
-        end = 85
-        step = batch_index - (1 if is_start else 0)
-        pct = start + int((step / total_batches) * (end - start))
+    for batch_index, batch in enumerate(
+        batch_list(records, batch_size=llm_batch_size), start=1
+    ):
+        pct = 60 + int((batch_index / total_batches) * (85 - 60))
         _maybe_update_job(update_job, job_id, pct)
 
-    decided = decide_with_llm(
-        candidates,
-        model=chat_model,
-        use_llm=use_llm,
-        batch_size=llm_batch_size,
-        progress_cb=progress_cb,
+        if use_llm:
+            try:
+                batch_decisions = llm_decide_for_batch(batch, model=chat_model)
+                batch_decisions = sorted(batch_decisions, key=lambda d: d.get("id", 0))
+                for d in batch_decisions:
+                    decisions.append(
+                        {
+                            "exclude": d.get("exclude", False),
+                            "suggested_negative": d.get("suggested_negative", ""),
+                            "reason": d.get("reason", ""),
+                        }
+                    )
+            except Exception:
+                for row in batch:
+                    decisions.append(llm_decide_for_row(row, model=chat_model))
+        else:
+            for row in batch:
+                decisions.append(
+                    {
+                        "exclude": True,
+                        "suggested_negative": str(row.get("search_term", "")),
+                        "reason": "Heuristic: below similarity threshold; LLM disabled.",
+                    }
+                )
+
+    _maybe_update_job(update_job, job_id, 85)
+
+    decided = pd.concat(
+        [candidates.reset_index(drop=True), pd.DataFrame(decisions)], axis=1
     )
     negatives_all = decided[decided["exclude"] == True].copy()
     stats["negatives_before_brand"] = int(len(negatives_all))
