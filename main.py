@@ -288,6 +288,16 @@ class JobStartRequest(BaseModel):
     brand_terms: str = ""  # comma separated (keeps parity with Next)
 
 
+# ----------------------------
+# Estimate request (Storage path)
+# ----------------------------
+class EstimateRequest(BaseModel):
+    uploads_bucket: str = Field(default=DEFAULT_UPLOADS_BUCKET)
+    search_path: str
+    min_clicks: int = 3
+    min_cost: float = 0.0
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -344,6 +354,43 @@ def run_audit(req: RunRequest):
 
     final_df = final_df.fillna("")
     return {"ok": True, "stats": stats, "results": final_df.to_dict(orient="records")}
+
+
+@app.post("/estimate")
+def estimate_terms(req: EstimateRequest):
+    """
+    Estimate billable search terms without running the audit.
+    """
+    try:
+        _require_supabase()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Supabase config error: {e}")
+
+    try:
+        search_df = _download_csv_from_storage(req.uploads_bucket, req.search_path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to download search CSV: {e}")
+
+    initial_rows = int(len(search_df)) if search_df is not None else 0
+
+    try:
+        filtered_search_df = _clean_and_filter_search_terms(
+            search_df, int(req.min_clicks), float(req.min_cost)
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to filter search terms: {e}")
+
+    filtered_rows = int(len(filtered_search_df)) if filtered_search_df is not None else 0
+
+    return {
+        "ok": True,
+        "initial_rows": initial_rows,
+        "filtered_rows": filtered_rows,
+    }
 
 
 # ----------------------------
