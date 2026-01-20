@@ -1,7 +1,6 @@
 import os
 import uuid
-import threading
-import time
+import asyncio
 from io import BytesIO
 from typing import Any, Dict, List, Optional
 
@@ -67,6 +66,13 @@ def _maybe_update_job(update_job, job_id, progress):
             update_job(job_id, {"progress": progress})
         except Exception as e:
             print(f"[maybe_update_job] failed to update progress {progress}: {e}")
+
+
+def _log_task_result(task: "asyncio.Task", job_id: str) -> None:
+    try:
+        task.result()
+    except Exception as e:
+        print(f"[job_task] job_id={job_id} background task failed: {e}")
 
 
 def _job_create(user_id: Optional[str]) -> str:
@@ -410,7 +416,7 @@ def estimate_terms(req: EstimateRequest):
 # ----------------------------
 # Job runner
 # ----------------------------
-def _run_job(job_id: str, search_df: pd.DataFrame, kw_df: pd.DataFrame, cfg: Dict[str, Any]):
+async def _run_job(job_id: str, search_df: pd.DataFrame, kw_df: pd.DataFrame, cfg: Dict[str, Any]):
     try:
         _job_update(
             job_id,
@@ -427,7 +433,7 @@ def _run_job(job_id: str, search_df: pd.DataFrame, kw_df: pd.DataFrame, cfg: Dic
             return
 
         _job_update(job_id, {"progress": 15, "message": "Preparing data…"})
-        time.sleep(0.05)
+        await asyncio.sleep(0.05)
 
         if _job_is_canceled(job_id):
             _job_update(job_id, {"status": "canceled", "progress": 100, "message": "Canceled."})
@@ -435,14 +441,21 @@ def _run_job(job_id: str, search_df: pd.DataFrame, kw_df: pd.DataFrame, cfg: Dic
 
         _job_update(job_id, {"progress": 25, "message": "Running pipeline (this may take a couple of minutes)…"})
 
-        final_df, stats = run_negative_keyword_pipeline(search_df, kw_df, cfg)
+        final_df, stats = await asyncio.to_thread(
+            run_negative_keyword_pipeline,
+            search_df,
+            kw_df,
+            cfg,
+            job_id,
+            _job_update,
+        )
 
         if _job_is_canceled(job_id):
             _job_update(job_id, {"status": "canceled", "progress": 100, "message": "Canceled."})
             return
 
         _job_update(job_id, {"progress": 90, "message": "Finalising results…"})
-        time.sleep(0.05)
+        await asyncio.sleep(0.05)
 
         if final_df is None or final_df.empty:
             _job_update(
@@ -483,7 +496,7 @@ def _run_job(job_id: str, search_df: pd.DataFrame, kw_df: pd.DataFrame, cfg: Dic
 
 
 @app.post("/jobs")
-def start_job(
+async def start_job(
     req: JobStartRequest,
     x_user_id: Optional[str] = Header(default=None),
 ):
@@ -612,13 +625,9 @@ def start_job(
             },
         )
 
-        # Start background thread with FILTERED dataframe
-        t = threading.Thread(
-            target=_run_job,
-            args=(job_id, filtered_search_df, kw_df, cfg),
-            daemon=True,
-        )
-        t.start()
+        # Start background task with FILTERED dataframe
+        task = asyncio.create_task(_run_job(job_id, filtered_search_df, kw_df, cfg))
+        task.add_done_callback(lambda t: _log_task_result(t, job_id))
 
         return {"ok": True, "job_id": job_id, "status": "queued"}
 
