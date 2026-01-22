@@ -2,6 +2,7 @@ import os
 import json
 import math
 import time
+import concurrent.futures
 from typing import List, Dict, Any, Tuple, Optional, Callable
 
 import numpy as np
@@ -16,6 +17,7 @@ from openai import OpenAI, RateLimitError, APIError, BadRequestError
 load_dotenv()
 
 _client: Optional[OpenAI] = None
+MAX_LLM_WORKERS = 5
 
 
 def get_client() -> OpenAI:
@@ -459,26 +461,20 @@ def run_negative_keyword_pipeline(
     # LLM decision
     records = candidates.to_dict("records")
     total_candidates = int(len(records))
-    total_batches = max(1, math.ceil(total_candidates / max(1, int(llm_batch_size))))
-    decisions: List[Dict[str, Any]] = []
+    batches = list(batch_list(records, batch_size=llm_batch_size))
+    total_batches = max(1, len(batches))
+    decisions_by_batch: Dict[int, List[Dict[str, Any]]] = {}
+    completed_batches = 0
 
-    for batch_index, batch in enumerate(
-        batch_list(records, batch_size=llm_batch_size), start=1
-    ):
-        pct = 60 + int((batch_index / total_batches) * (85 - 60))
-        _maybe_update_job(update_job, job_id, pct)
-        try:
-            time.sleep(0)
-        except Exception:
-            pass
-        print(f"[pipeline] progress {pct}% (batch {batch_index}/{total_batches})")
-
+    def _process_batch(batch_index: int, batch: List[Dict[str, Any]]) -> Tuple[int, List[Dict[str, Any]]]:
+        print(f"[pipeline] llm batch {batch_index}/{total_batches} start")
         if use_llm:
             try:
                 batch_decisions = llm_decide_for_batch(batch, model=chat_model)
                 batch_decisions = sorted(batch_decisions, key=lambda d: d.get("id", 0))
+                out: List[Dict[str, Any]] = []
                 for d in batch_decisions:
-                    decisions.append(
+                    out.append(
                         {
                             "exclude": d.get("exclude", False),
                             "suggested_negative": d.get("suggested_negative", ""),
@@ -486,17 +482,50 @@ def run_negative_keyword_pipeline(
                         }
                     )
             except Exception:
-                for row in batch:
-                    decisions.append(llm_decide_for_row(row, model=chat_model))
+                out = [llm_decide_for_row(row, model=chat_model) for row in batch]
         else:
-            for row in batch:
-                decisions.append(
-                    {
-                        "exclude": True,
-                        "suggested_negative": str(row.get("search_term", "")),
-                        "reason": "Heuristic: below similarity threshold; LLM disabled.",
-                    }
+            out = [
+                {
+                    "exclude": True,
+                    "suggested_negative": str(row.get("search_term", "")),
+                    "reason": "Heuristic: below similarity threshold; LLM disabled.",
+                }
+                for row in batch
+            ]
+        print(f"[pipeline] llm batch {batch_index}/{total_batches} done")
+        return batch_index, out
+
+    if use_llm:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_LLM_WORKERS) as executor:
+            futures = [
+                executor.submit(_process_batch, batch_index, batch)
+                for batch_index, batch in enumerate(batches, start=1)
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                batch_index, out = future.result()
+                decisions_by_batch[batch_index] = out
+                completed_batches += 1
+                pct = 60 + int((completed_batches / total_batches) * (85 - 60))
+                _maybe_update_job(update_job, job_id, pct)
+                try:
+                    time.sleep(0)
+                except Exception:
+                    pass
+                print(
+                    f"[pipeline] progress {pct}% (completed {completed_batches}/{total_batches})"
                 )
+    else:
+        for batch_index, batch in enumerate(batches, start=1):
+            _, out = _process_batch(batch_index, batch)
+            decisions_by_batch[batch_index] = out
+            completed_batches += 1
+            pct = 60 + int((completed_batches / total_batches) * (85 - 60))
+            _maybe_update_job(update_job, job_id, pct)
+            try:
+                time.sleep(0)
+            except Exception:
+                pass
+            print(f"[pipeline] progress {pct}% (completed {completed_batches}/{total_batches})")
 
     _maybe_update_job(update_job, job_id, 85)
     try:
@@ -504,6 +533,10 @@ def run_negative_keyword_pipeline(
     except Exception:
         pass
     print("[pipeline] progress 85%")
+
+    decisions: List[Dict[str, Any]] = []
+    for batch_index in range(1, total_batches + 1):
+        decisions.extend(decisions_by_batch.get(batch_index, []))
 
     decided = pd.concat(
         [candidates.reset_index(drop=True), pd.DataFrame(decisions)], axis=1
