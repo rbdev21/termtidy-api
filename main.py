@@ -38,6 +38,7 @@ DEFAULT_UPLOADS_BUCKET = os.getenv("TERMTIDY_UPLOADS_BUCKET", "termtidy-uploads"
 # Table names (override via env if you want)
 JOBS_TABLE = os.getenv("TERMTIDY_JOBS_TABLE", "audit_jobs")
 SUBS_TABLE = os.getenv("TERMTIDY_SUBSCRIPTIONS_TABLE", "subscriptions")
+DEFAULT_LLM_BATCH_SIZE = 200
 
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
@@ -280,7 +281,6 @@ class RunRequest(BaseModel):
     min_cost: float = 0.0
     similarity_threshold: float = 0.75
     use_llm: bool = True
-    batch_size: int = 5
     currency: str = "GBP"
     brand_terms: List[str] = []
 
@@ -297,7 +297,6 @@ class JobStartRequest(BaseModel):
     min_cost: float = 0.0
     similarity_threshold: float = 0.75
     use_llm: bool = True
-    batch_size: int = 5
     currency: str = "GBP"
     brand_terms: str = ""  # comma separated (keeps parity with Next)
 
@@ -335,7 +334,7 @@ def run_audit(req: RunRequest):
         "min_cost": req.min_cost,
         "similarity_threshold": req.similarity_threshold,
         "use_llm": req.use_llm,
-        "batch_size": req.batch_size,
+        "batch_size": DEFAULT_LLM_BATCH_SIZE,
         "embedding_model": "text-embedding-3-small",
         "chat_model": "gpt-4.1-mini",
         "brand_terms": req.brand_terms,
@@ -505,7 +504,7 @@ async def start_job(
       - downloads CSVs from Supabase Storage
       - removes blank rows + applies min clicks/cost filters
       - meters based on filtered_rows via reserve_terms RPC
-      - starts background pipeline thread with filtered dataframe
+      - starts background pipeline task with filtered dataframe
     """
     # Ensure Supabase configured
     try:
@@ -533,7 +532,7 @@ async def start_job(
             "min_cost": float(req.min_cost),
             "similarity_threshold": float(req.similarity_threshold),
             "use_llm": bool(req.use_llm),
-            "batch_size": int(req.batch_size),
+            "batch_size": DEFAULT_LLM_BATCH_SIZE,
             "embedding_model": "text-embedding-3-small",
             "chat_model": "gpt-4.1-mini",
             "brand_terms": [t.strip() for t in (req.brand_terms or "").split(",") if t.strip()],
