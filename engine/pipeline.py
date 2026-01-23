@@ -603,7 +603,6 @@ def run_negative_keyword_pipeline(
         "clicks",
         "cost",
         "conversions",
-        "reason",
     ]
     export_cols = [c for c in export_cols if c in final_negatives.columns]
     final_df = final_negatives[export_cols].copy()
