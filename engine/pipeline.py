@@ -165,13 +165,11 @@ Rules:
   for the given keyword and likely to waste budget.
 - Do NOT exclude search terms that are obviously relevant, even if they have no conversions yet.
 - The suggested_negative should be a single word or short phrase that blocks similar irrelevant queries.
-- Keep the reason short (1–2 sentences).
 
 Respond ONLY as strict JSON in this format:
 {{
   "exclude": true or false,
-  "suggested_negative": "single word or short phrase",
-  "reason": "short explanation"
+  "suggested_negative": "single word or short phrase"
 }}
 """.strip()
 
@@ -203,7 +201,6 @@ Rules:
 - Mark "exclude": true only if it is clearly irrelevant or low-intent for the given keyword.
 - Do NOT exclude search terms that are obviously relevant, even if they have no conversions yet.
 - The suggested_negative should be a single word or short phrase that blocks similar irrelevant queries.
-- Keep the reason short (1–2 sentences).
 
 Input items (JSON array):
 {payload}
@@ -212,8 +209,7 @@ Respond ONLY as strict JSON array. Each item must include:
 {{
   "id": number,
   "exclude": true or false,
-  "suggested_negative": "single word or short phrase",
-  "reason": "short explanation"
+  "suggested_negative": "single word or short phrase"
 }}
 """.strip()
 
