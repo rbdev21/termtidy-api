@@ -1,5 +1,6 @@
 import os
 import base64
+import concurrent.futures
 from io import BytesIO
 from typing import List, Dict, Any
 
@@ -30,22 +31,26 @@ def send_job_complete_email(
         csv_bytes = csv_buffer.getvalue()
         encoded = base64.b64encode(csv_bytes).decode("ascii")
 
-        resend.Emails.send(
-            {
-                "from": email_from,
-                "to": [to_email],
-                "subject": "Your TermTidy audit is ready",
-                "text": (
-                    "Your TermTidy audit has completed successfully. "
-                    "Your results are attached as a CSV."
-                ),
-                "attachments": [
-                    {
-                        "filename": f"termtidy-{job_id}.csv",
-                        "content": encoded,
-                    }
-                ],
-            }
-        )
+        payload = {
+            "from": email_from,
+            "to": [to_email],
+            "subject": "Your TermTidy audit is ready",
+            "text": (
+                "Your TermTidy audit has completed successfully. "
+                "Your results are attached as a CSV."
+            ),
+            "attachments": [
+                {
+                    "filename": f"termtidy-{job_id}.csv",
+                    "content": encoded,
+                }
+            ],
+        }
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(resend.Emails.send, payload)
+            future.result(timeout=10)
+
+        print(f"[email] sent completion email for job_id={job_id}")
     except Exception as e:
         print(f"[email] failed to send completion email: {e}")

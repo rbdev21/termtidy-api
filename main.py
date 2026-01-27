@@ -77,6 +77,30 @@ def _log_task_result(task: "asyncio.Task", job_id: str) -> None:
         print(f"[job_task] job_id={job_id} background task failed: {e}")
 
 
+def _send_completion_email(job_id: str, results_list: List[Dict[str, Any]]) -> None:
+    try:
+        job = _job_read(job_id)
+        user_id = job.get("user_id")
+        if not user_id:
+            print(f"[email] missing user_id for job_id={job_id}")
+            return
+
+        sb = _require_supabase()
+        user_resp = sb.auth.admin.get_user_by_id(user_id)
+        user_email = getattr(getattr(user_resp, "user", None), "email", None)
+        if not user_email:
+            print(f"[email] missing user email for job_id={job_id}")
+            return
+
+        send_job_complete_email(
+            to_email=user_email,
+            job_id=job_id,
+            results=results_list,
+        )
+    except Exception as e:
+        print(f"[email] failed to send completion email: {e}")
+
+
 def _job_create(user_id: Optional[str]) -> str:
     sb = _require_supabase()
     job_id = str(uuid.uuid4())
@@ -485,21 +509,10 @@ async def _run_job(job_id: str, search_df: pd.DataFrame, kw_df: pd.DataFrame, cf
             },
         )
         if results_list:
-            try:
-                job = _job_read(job_id)
-                user_id = job.get("user_id")
-                if user_id:
-                    sb = _require_supabase()
-                    user_resp = sb.auth.admin.get_user_by_id(user_id)
-                    user_email = getattr(getattr(user_resp, "user", None), "email", None)
-                    if user_email:
-                        send_job_complete_email(
-                            to_email=user_email,
-                            job_id=job_id,
-                            results=results_list,
-                        )
-            except Exception as e:
-                print(f"[email] failed to send completion email: {e}")
+            task = asyncio.create_task(
+                asyncio.to_thread(_send_completion_email, job_id, results_list)
+            )
+            task.add_done_callback(lambda t: _log_task_result(t, job_id))
     except Exception as e:
         _job_update(
             job_id,
