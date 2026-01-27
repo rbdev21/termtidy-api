@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 
 from engine.pipeline import run_negative_keyword_pipeline
+from engine.email import send_job_complete_email
 
 load_dotenv()
 
@@ -471,6 +472,7 @@ async def _run_job(job_id: str, search_df: pd.DataFrame, kw_df: pd.DataFrame, cf
             return
 
         final_df = final_df.fillna("")
+        results_list = final_df.to_dict(orient="records")
         _job_update(
             job_id,
             {
@@ -478,10 +480,26 @@ async def _run_job(job_id: str, search_df: pd.DataFrame, kw_df: pd.DataFrame, cf
                 "progress": 100,
                 "message": f"Complete. Found {len(final_df)} suggested negatives.",
                 "stats": stats,
-                "results": final_df.to_dict(orient="records"),
+                "results": results_list,
                 "error": None,
             },
         )
+        if results_list:
+            try:
+                job = _job_read(job_id)
+                user_id = job.get("user_id")
+                if user_id:
+                    sb = _require_supabase()
+                    user_resp = sb.auth.admin.get_user_by_id(user_id)
+                    user_email = getattr(getattr(user_resp, "user", None), "email", None)
+                    if user_email:
+                        send_job_complete_email(
+                            to_email=user_email,
+                            job_id=job_id,
+                            results=results_list,
+                        )
+            except Exception as e:
+                print(f"[email] failed to send completion email: {e}")
     except Exception as e:
         _job_update(
             job_id,
