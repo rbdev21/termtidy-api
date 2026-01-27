@@ -15,12 +15,22 @@ def send_job_complete_email(
     results: List[Dict[str, Any]],
 ) -> None:
     try:
-        if os.getenv("EMAIL_ENABLED", "").lower() != "true":
+        enabled_raw = os.getenv("EMAIL_ENABLED", "")
+        enabled = enabled_raw.strip().lower() in {"true", "1", "yes", "y"}
+        if not enabled:
+            print(f"[email] skipped (EMAIL_ENABLED={enabled_raw!r})")
             return
 
         api_key = os.getenv("RESEND_API_KEY")
         email_from = os.getenv("EMAIL_FROM")
-        if not api_key or not email_from or not to_email:
+        if not api_key:
+            print("[email] missing RESEND_API_KEY")
+            return
+        if not email_from:
+            print("[email] missing EMAIL_FROM")
+            return
+        if not to_email:
+            print("[email] missing recipient email")
             return
 
         resend.api_key = api_key
@@ -47,10 +57,11 @@ def send_job_complete_email(
             ],
         }
 
+        print(f"[email] sending completion email job_id={job_id} to={to_email}")
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(resend.Emails.send, payload)
-            future.result(timeout=10)
+            resp = future.result(timeout=20)
 
-        print(f"[email] sent completion email for job_id={job_id}")
+        print(f"[email] sent completion email for job_id={job_id} resp={resp}")
     except Exception as e:
         print(f"[email] failed to send completion email: {e}")

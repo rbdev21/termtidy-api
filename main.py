@@ -1,6 +1,7 @@
 import os
 import uuid
 import asyncio
+import traceback
 from io import BytesIO
 from typing import Any, Dict, List, Optional
 
@@ -79,6 +80,7 @@ def _log_task_result(task: "asyncio.Task", job_id: str) -> None:
 
 def _send_completion_email(job_id: str, results_list: List[Dict[str, Any]]) -> None:
     try:
+        print(f"[email] preparing completion email job_id={job_id}")
         job = _job_read(job_id)
         user_id = job.get("user_id")
         if not user_id:
@@ -442,6 +444,7 @@ def estimate_terms(req: EstimateRequest):
 # ----------------------------
 async def _run_job(job_id: str, search_df: pd.DataFrame, kw_df: pd.DataFrame, cfg: Dict[str, Any]):
     try:
+        print(f"[job {job_id}] starting run")
         _job_update(
             job_id,
             {
@@ -473,6 +476,9 @@ async def _run_job(job_id: str, search_df: pd.DataFrame, kw_df: pd.DataFrame, cf
             job_id,
             _job_update,
         )
+        print(
+            f"[job {job_id}] pipeline returned rows={len(final_df) if final_df is not None else None}"
+        )
 
         if _job_is_canceled(job_id):
             _job_update(job_id, {"status": "canceled", "progress": 100, "message": "Canceled."})
@@ -497,6 +503,7 @@ async def _run_job(job_id: str, search_df: pd.DataFrame, kw_df: pd.DataFrame, cf
 
         final_df = final_df.fillna("")
         results_list = final_df.to_dict(orient="records")
+        print(f"[job {job_id}] updating job row with done + results")
         _job_update(
             job_id,
             {
@@ -508,12 +515,18 @@ async def _run_job(job_id: str, search_df: pd.DataFrame, kw_df: pd.DataFrame, cf
                 "error": None,
             },
         )
+        print(f"[job {job_id}] job row updated with done + results")
         if results_list:
+            print(f"[job {job_id}] scheduling completion email")
             task = asyncio.create_task(
                 asyncio.to_thread(_send_completion_email, job_id, results_list)
             )
             task.add_done_callback(lambda t: _log_task_result(t, job_id))
+        else:
+            print(f"[job {job_id}] no results, skipping completion email")
     except Exception as e:
+        print(f"[job {job_id}] error: {e}")
+        print(traceback.format_exc())
         _job_update(
             job_id,
             {
