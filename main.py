@@ -137,9 +137,11 @@ def _consume_credits(user_id: str, amount: int, job_id: str) -> Dict[str, Any]:
         res = sb.rpc(
             "consume_credits",
             {
-                "p_user_id": user_id,
                 "p_amount": int(amount),
                 "p_job_id": job_id,
+                "p_meta": {},
+                "p_reason": "audit_run",
+                "p_user_id": user_id,
             },
         ).execute()
     except Exception as e:
