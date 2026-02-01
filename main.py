@@ -131,6 +131,28 @@ def _job_read(job_id: str) -> Dict[str, Any]:
     return data[0]
 
 
+def _consume_credits(user_id: str, amount: int, job_id: str) -> Dict[str, Any]:
+    sb = _require_supabase()
+    try:
+        res = sb.rpc(
+            "consume_credits",
+            {
+                "p_user_id": user_id,
+                "p_amount": int(amount),
+                "p_job_id": job_id,
+            },
+        ).execute()
+    except Exception as e:
+        raise RuntimeError(f"consume_credits RPC failed: {e}")
+
+    data = res.data
+    row = data[0] if isinstance(data, list) and data else data
+    if not isinstance(row, dict):
+        raise RuntimeError(f"Unexpected consume_credits response: {data}")
+
+    return row
+
+
 def _job_is_canceled(job_id: str) -> bool:
     try:
         job = _job_read(job_id)
@@ -588,25 +610,22 @@ async def start_job(
         _job_update(
             job_id,
             {
-                "message": f"Checking credits… ({filtered_rows:,} billable rows)",
+                "message": f"Consuming credits… ({filtered_rows:,} billable rows)",
                 "progress": 5,
             },
         )
-        print("[credits] checking balance")
-        sb = _require_supabase()
+        print("[credits] consuming credits")
+
         try:
-            bal_res = sb.rpc("get_credits_balance", {"p_user_id": x_user_id}).execute()
+            consume_row = _consume_credits(x_user_id, filtered_rows, job_id)
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Credits RPC failed: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
-        bal_data = bal_res.data
-        bal_row = bal_data[0] if isinstance(bal_data, list) and bal_data else bal_data
-        if not isinstance(bal_row, dict):
-            raise HTTPException(status_code=500, detail=f"Unexpected credits balance response: {bal_data}")
-
-        balance = int(bal_row.get("balance", 0))
-        if balance < filtered_rows:
-            detail = {"required": filtered_rows, "available": balance}
+        if not consume_row.get("ok", False):
+            detail = {
+                "required": filtered_rows,
+                "available": consume_row.get("available"),
+            }
             _job_update(
                 job_id,
                 {
@@ -629,19 +648,7 @@ async def start_job(
                 detail={"error": "Insufficient credits", "detail": detail, "job_id": job_id},
             )
 
-        try:
-            sb.rpc(
-                "apply_credits",
-                {
-                    "p_user_id": x_user_id,
-                    "p_change": -int(filtered_rows),
-                    "p_reason": "audit",
-                    "p_job_id": job_id,
-                },
-            ).execute()
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Credits deduction failed: {e}")
-        print(f"[credits] deducted {filtered_rows} credits")
+        print(f"[credits] consumed {filtered_rows} credits")
 
         # Store pre-pipeline stats so UI can see counts even if pipeline fails later
         _job_update(
