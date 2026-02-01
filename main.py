@@ -272,32 +272,6 @@ def _download_csv_from_storage(bucket: str, path: str) -> pd.DataFrame:
 
 
 # ----------------------------
-# Metering helper (reserve_terms RPC)
-# ----------------------------
-def _reserve_terms(user_id: str, month_start: str, amount: int) -> Dict[str, Any]:
-    sb = _require_supabase()
-    try:
-        res = sb.rpc(
-            "reserve_terms",
-            {
-                "p_user_id": user_id,
-                "p_month_start": month_start,
-                "p_amount": int(amount),
-            },
-        ).execute()
-    except Exception as e:
-        raise RuntimeError(f"reserve_terms RPC failed: {e}")
-
-    data = res.data
-    # Supabase can return list or dict depending on RPC definition
-    row = data[0] if isinstance(data, list) and data else data
-    if not isinstance(row, dict):
-        raise RuntimeError(f"Unexpected reserve_terms response: {data}")
-
-    return row
-
-
-# ----------------------------
 # Existing JSON /run endpoint (kept)
 # ----------------------------
 class RunRequest(BaseModel):
@@ -547,7 +521,7 @@ async def start_job(
     Storage-first job start:
       - downloads CSVs from Supabase Storage
       - removes blank rows + applies min clicks/cost filters
-      - meters based on filtered_rows via reserve_terms RPC
+      - meters based on filtered_rows via credits RPCs
       - starts background pipeline task with filtered dataframe
     """
     # Ensure Supabase configured
@@ -611,34 +585,35 @@ async def start_job(
             return {"ok": True, "job_id": job_id, "status": "done"}
 
         # Metering based on FILTERED rows
-        month_start = _get_period_start_for_user(x_user_id)
         _job_update(
             job_id,
             {
-                "message": f"Reserving quota… ({filtered_rows:,} billable rows)",
+                "message": f"Checking credits… ({filtered_rows:,} billable rows)",
                 "progress": 5,
             },
         )
+        print("[credits] checking balance")
+        sb = _require_supabase()
+        try:
+            bal_res = sb.rpc("get_credits_balance", {"p_user_id": x_user_id}).execute()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Credits RPC failed: {e}")
 
-        reserve_row = _reserve_terms(x_user_id, month_start, filtered_rows)
+        bal_data = bal_res.data
+        bal_row = bal_data[0] if isinstance(bal_data, list) and bal_data else bal_data
+        if not isinstance(bal_row, dict):
+            raise HTTPException(status_code=500, detail=f"Unexpected credits balance response: {bal_data}")
 
-        if not reserve_row.get("ok", False):
-            # Quota exceeded -> mark job error and return 402
-            detail = {
-                "reason": reserve_row.get("reason") or "quota_exceeded",
-                "requested": filtered_rows,
-                "month_start": month_start,
-                "quota": reserve_row.get("quota"),
-                "used": reserve_row.get("used"),
-                "remaining": reserve_row.get("remaining"),
-            }
+        balance = int(bal_row.get("balance", 0))
+        if balance < filtered_rows:
+            detail = {"required": filtered_rows, "available": balance}
             _job_update(
                 job_id,
                 {
                     "status": "error",
                     "progress": 100,
-                    "message": "Quota exceeded.",
-                    "error": {"message": "Quota exceeded", "detail": detail},
+                    "message": "Insufficient credits.",
+                    "error": {"message": "Insufficient credits", "detail": detail},
                     "stats": {
                         "initial_rows": initial_rows,
                         "filtered_rows": filtered_rows,
@@ -649,7 +624,24 @@ async def start_job(
                     "results": [],
                 },
             )
-            raise HTTPException(status_code=402, detail={"error": "Quota exceeded", "detail": detail, "job_id": job_id})
+            raise HTTPException(
+                status_code=402,
+                detail={"error": "Insufficient credits", "detail": detail, "job_id": job_id},
+            )
+
+        try:
+            sb.rpc(
+                "apply_credits",
+                {
+                    "p_user_id": x_user_id,
+                    "p_change": -int(filtered_rows),
+                    "p_reason": "audit",
+                    "p_job_id": job_id,
+                },
+            ).execute()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Credits deduction failed: {e}")
+        print(f"[credits] deducted {filtered_rows} credits")
 
         # Store pre-pipeline stats so UI can see counts even if pipeline fails later
         _job_update(
